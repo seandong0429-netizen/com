@@ -200,6 +200,9 @@ class DashboardPage(QWidget):
             t.setHorizontalHeaderLabels(["客户", "项目", "天数"])
             t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             t.setFixedHeight(180)
+            t.itemDoubleClicked.connect(self.on_row_double_clicked)
+
+        self.visit_list.itemDoubleClicked.connect(self.on_row_double_clicked)
 
         alert_layout.addLayout(vbox_red)
         alert_layout.addLayout(vbox_orange)
@@ -212,6 +215,18 @@ class DashboardPage(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self.load_data()
+
+    def on_row_double_clicked(self, item):
+        tw = item.tableWidget()
+        first_item = tw.item(item.row(), 0)
+        p_no = first_item.data(Qt.UserRole) if first_item else None
+        if p_no:
+            try:
+                dlg = ProjectDetailDialog(p_no, self)
+                dlg.exec()
+                self.load_data()
+            except Exception as e:
+                InfoBar.error("加载失败", f"无法打开项目详情: {str(e)}", parent=self.window())
 
     def load_data(self):
         with sqlite3.connect(DB_NAME) as conn:
@@ -260,13 +275,13 @@ class DashboardPage(QWidget):
             
             # --- 合同到期提醒 ---
             contracts = conn.execute("""
-                SELECT c.name, p.project_name, ct.end_date 
+                SELECT c.name, p.project_name, ct.end_date, p.project_no
                 FROM contracts ct 
                 JOIN projects p ON ct.project_no = p.project_no
                 JOIN customers c ON p.customer_id = c.id
             """).fetchall()
             
-            for cust, proj, edate in contracts:
+            for cust, proj, edate, p_no in contracts:
                 try:
                     days = (datetime.strptime(edate, "%Y-%m-%d").date() - date.today()).days
                     target_table = None
@@ -277,14 +292,18 @@ class DashboardPage(QWidget):
                     if target_table:
                         idx = target_table.rowCount()
                         target_table.insertRow(idx)
-                        target_table.setItem(idx, 0, QTableWidgetItem(cust))
+                        
+                        item_cust = QTableWidgetItem(cust)
+                        item_cust.setData(Qt.UserRole, p_no)
+                        
+                        target_table.setItem(idx, 0, item_cust)
                         target_table.setItem(idx, 1, QTableWidgetItem(proj))
                         target_table.setItem(idx, 2, QTableWidgetItem(f"{days}天"))
                 except: pass
 
             # --- 近期拜访提醒 (30天内) ---
             visits_30 = conn.execute("""
-                SELECT c.name, p.project_name, p.next_visit_date 
+                SELECT c.name, p.project_name, p.next_visit_date, p.project_no
                 FROM projects p 
                 JOIN customers c ON p.customer_id = c.id
                 WHERE p.next_visit_date IS NOT NULL AND p.next_visit_date != ''
@@ -292,14 +311,18 @@ class DashboardPage(QWidget):
                 ORDER BY p.next_visit_date ASC
             """).fetchall()
             
-            for cust, proj, vdate in visits_30:
+            for cust, proj, vdate, p_no in visits_30:
                 try:
                     v_d = datetime.strptime(vdate, "%Y-%m-%d").date()
                     days = (v_d - date.today()).days
                     if 0 <= days <= 30:
                         idx = self.visit_list.rowCount()
                         self.visit_list.insertRow(idx)
-                        self.visit_list.setItem(idx, 0, QTableWidgetItem(cust))
+                        
+                        item_cust = QTableWidgetItem(cust)
+                        item_cust.setData(Qt.UserRole, p_no)
+                        self.visit_list.setItem(idx, 0, item_cust)
+                        
                         self.visit_list.setItem(idx, 1, QTableWidgetItem(proj))
                         self.visit_list.setItem(idx, 2, QTableWidgetItem(vdate))
                         item_days = QTableWidgetItem(f"{days}天")
