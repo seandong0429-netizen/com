@@ -93,15 +93,26 @@ ScrollArea.eventFilter = safe_event_filter
 # ==========================================
 DB_NAME = "crm_enterprise.db"
 
+# ==========================================
+# 核心数据库连接工厂 (性能调优关键)
+# ==========================================
+def get_db_conn(timeout=10):
+    """
+    获取统一配置的数据库连接，强制注入性能 PRAGMA
+    """
+    conn = sqlite3.connect(DB_NAME, timeout=timeout)
+    # 强制开启高性能配置
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
 def init_db():
     """统一数据库初始化与结构查体 (CRM 核心)"""
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("PRAGMA busy_timeout = 5000")
-        # 强制开启 WAL 模式，极大提升云同步环境下的并发稳定性
-        cursor.execute("PRAGMA journal_mode = WAL")
         
         # 1. 基础建表 (核心结构)
         tables = {
@@ -136,24 +147,25 @@ def init_db():
 # ==========================================
 # 全局审计记录函数
 # ==========================================
-def log_action(module, action_type, target_id, details=""):
+def log_action(module, action_type, target_id, details="", conn=None):
     """
     记录操作审计日志
-    :param module: 模块名 (如：客户中心)
-    :param action_type: 动作 (新增/修改/删除/流转)
-    :param target_id: 关联对象标识
-    :param details: 详细描述
+    :param conn: 可选，如果传入已有连接，则在同一事务中提交，不独立开表 (性能爆破点)
     """
+    sql = "INSERT INTO action_logs (timestamp, module, action_type, target_id, details) VALUES (datetime('now', 'localtime'),?,?,?,?)"
+    params = (module, action_type, str(target_id), details)
+    
     try:
-        # 使用独立的连接参数，确保日志记录不影响主业务逻辑
-        with sqlite3.connect(DB_NAME, timeout=20) as conn:
-            conn.execute("INSERT INTO action_logs (timestamp, module, action_type, target_id, details) VALUES (datetime('now', 'localtime'),?,?,?,?)",
-                        (module, action_type, str(target_id), details))
-            conn.commit()
-    except sqlite3.OperationalError as e:
-        print(f"Audit Log I/O Delay: {e} - 系统正尝试同步数据库，请稍候")
+        if conn:
+            # 复用业务逻辑的连接，实现原子事务
+            conn.execute(sql, params)
+        else:
+            # 兼容模式：如果没有上下文连接，则独立开表（不推荐用于高频业务）
+            with get_db_conn(timeout=20) as standalone_conn:
+                standalone_conn.execute(sql, params)
+                standalone_conn.commit()
     except Exception as e:
-        print(f"Audit Log Error: {e}")
+        print(f"Log Action Error (Module: {module}): {e}")
 
 # ==========================================
 # 辅助组件：KPI 卡片
@@ -413,7 +425,7 @@ class DashboardPage(QWidget):
 
     def load_data(self):
         try:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 # 增强健壮性：优先检查关键表是否存在，防止 patch_db 未完成导致的崩溃
                 table_check = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='payment_plans'").fetchone()
                 if not table_check:
@@ -587,7 +599,7 @@ class CustomerContactMatrix(QDialog):
 
     def load_contacts(self, cust_id):
         self.table.setRowCount(0)
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             cur = conn.execute("SELECT name, post, dept, phone, role_type, is_decision_maker FROM contacts WHERE customer_id=?", (cust_id,))
             rows = cur.fetchall()
             self.info.setText(f"客户「{self.windowTitle().split(' - ')[-1]}」决策链记录: 共 {len(rows)} 人")
@@ -702,7 +714,7 @@ class MasterDataPage(QWidget):
     def load_customers(self):
         keyword = self.cust_search.text().strip()
         self.cust_table.setRowCount(0)
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             sql = "SELECT id, name, industry, level, address FROM customers"
             if keyword:
                 sql += f" WHERE name LIKE '%{keyword}%' OR industry LIKE '%{keyword}%'"
@@ -770,36 +782,41 @@ class MasterDataPage(QWidget):
         """深度安全删除客户逻辑：确保物理级联清理"""
         res = MessageBox("确定永久删除客户?", f"即将移除客户 [{cust_name}]。这将同步永久删除该客户下所有的：\n1. 联系人矩阵\n2. 销售项目\n3. 跟进记录与待办\n4. 报价与合同资料\n\n此操作不可撤销，确认吗？", self.window())
         if res.exec():
-            with sqlite3.connect(DB_NAME) as conn:
-                conn.execute("PRAGMA foreign_keys = ON")
-                # 1. 识别该客户名下的所有项目编号
-                p_nos = [r[0] for r in conn.execute("SELECT project_no FROM projects WHERE customer_id=?", (cust_id,)).fetchall()]
-                
-                # 2. 手动清理关联业务数据 (针对未启用物理级联约束的旧库)
-                for p_no in p_nos:
-                    conn.execute("DELETE FROM follow_ups WHERE project_no=?", (p_no,))
-                    conn.execute("DELETE FROM quotations WHERE project_no=?", (p_no,))
-                    conn.execute("DELETE FROM contracts WHERE project_no=?", (p_no,))
-                    conn.execute("DELETE FROM payment_plans WHERE project_no=?", (p_no,))
-                
-                # 3. 删除项目与联系人
-                conn.execute("DELETE FROM projects WHERE customer_id=?", (cust_id,))
-                conn.execute("DELETE FROM contacts WHERE customer_id=?", (cust_id,))
-                
-                # 4. 最后删除客户主体
-                conn.execute("DELETE FROM customers WHERE id=?", (cust_id,))
-                conn.commit()
+            try:
+                with get_db_conn() as conn:
+                    # 1. 识别该客户名下的所有项目编号
+                    p_nos = [r[0] for r in conn.execute("SELECT project_no FROM projects WHERE customer_id=?", (cust_id,)).fetchall()]
+                    
+                    # 2. 手动清理关联业务数据
+                    for p_no in p_nos:
+                        conn.execute("DELETE FROM follow_ups WHERE project_no=?", (p_no,))
+                        conn.execute("DELETE FROM quotations WHERE project_no=?", (p_no,))
+                        conn.execute("DELETE FROM contracts WHERE project_no=?", (p_no,))
+                        conn.execute("DELETE FROM payment_plans WHERE project_no=?", (p_no,))
+                    
+                    # 3. 删除项目与联系人
+                    conn.execute("DELETE FROM projects WHERE customer_id=?", (cust_id,))
+                    conn.execute("DELETE FROM contacts WHERE customer_id=?", (cust_id,))
+                    
+                    # 4. 删除客户主体
+                    conn.execute("DELETE FROM customers WHERE id=?", (cust_id,))
+                    
+                    # 5. 原子级记录日志 (注意这里传入了 conn)
+                    log_action("基础档案", "深度删除客户", cust_name, f"ID: {cust_id}", conn=conn)
+                    
+                    conn.commit()
+            except Exception as e:
+                InfoBar.error("删除失败", str(e), duration=3000, parent=self.window())
+                return
             
-            # [核心修复] 发送到信号总线：强制看板、待办、项目页同步刷新
+            # [核心刷新] 只有在事务成功提交后才触发 UI 信号
             SIGNAL_BUS.projectChanged.emit() 
-            
-            log_action("基础档案", "深度删除客户", cust_name, f"ID: {cust_id}")
-            self.load_customers() # 刷新本页列表
+            self.load_customers()
             InfoBar.success("深度清理完成", f"客户 {cust_name} 及其所有历史业务数据已从系统中彻底移除", duration=3000, parent=self.window())
 
     def show_edit_customer(self, cust_id):
         """弹出修改客户对话框"""
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             data = conn.execute("SELECT name, industry, level, address FROM customers WHERE id=?", (cust_id,)).fetchone()
         
         if not data: return
@@ -833,7 +850,7 @@ class MasterDataPage(QWidget):
         
         if dlg.exec():
             if not name.text(): return
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 conn.execute("UPDATE customers SET name=?, industry=?, level=?, address=? WHERE id=?",
                             (name.text(), industry.currentText(), level.currentText()[0], addr.text(), cust_id))
                 conn.commit()
@@ -854,7 +871,7 @@ class MasterDataPage(QWidget):
 
     def load_suppliers(self):
         self.supp_table.setRowCount(0)
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             cur = conn.execute("SELECT id, name, category, contact_person, phone FROM suppliers")
             for r in cur:
                 idx = self.supp_table.rowCount()
@@ -881,13 +898,17 @@ class MasterDataPage(QWidget):
         
         if dlg.exec():
             if not name.text(): return
-            with sqlite3.connect(DB_NAME) as conn:
-                try:
+            try:
+                with get_db_conn() as conn:
                     conn.execute("INSERT INTO customers (name, industry, level, address) VALUES (?,?,?,?)",
                                 (name.text(), industry.currentText(), level.currentText()[0], addr.text()))
-                    log_action("基础档案", "新增客户", name.text(), f"级别: {level.currentText()}")
-                except: InfoBar.error("错误", "客户名已存在", parent=self.window())
-            self.load_customers()
+                    # 原子化日志记录
+                    log_action("基础档案", "新增客户", name.text(), f"级别: {level.currentText()}", conn=conn)
+                    conn.commit()
+                self.load_customers()
+                InfoBar.success("保存成功", f"客户 {name.text()} 已入库", duration=2000, parent=self.window())
+            except Exception as e:
+                InfoBar.error("错误", f"保存失败: {str(e)}", parent=self.window())
 
     def show_add_supplier(self):
         dlg = QDialog(self)
@@ -905,11 +926,17 @@ class MasterDataPage(QWidget):
         btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
         if dlg.exec():
-            with sqlite3.connect(DB_NAME) as conn:
-                conn.execute("INSERT INTO suppliers (name, category, contact_person, phone) VALUES (?,?,?,?)",
-                            (name.text(), cat.currentText(), cp.text(), ph.text()))
-                log_action("基础档案", "新增供应商", name.text(), f"类别: {cat.currentText()}")
-            self.load_suppliers()
+            try:
+                with get_db_conn() as conn:
+                    conn.execute("INSERT INTO suppliers (name, category, contact_person, phone) VALUES (?,?,?,?)",
+                                (name.text(), cat.currentText(), cp.text(), ph.text()))
+                    # 原子化日志记录
+                    log_action("基础档案", "新增供应商", name.text(), f"类别: {cat.currentText()}", conn=conn)
+                    conn.commit()
+                self.load_suppliers()
+                InfoBar.success("保存成功", f"供应商 {name.text()} 已入库", duration=2000, parent=self.window())
+            except Exception as e:
+                InfoBar.error("错误", f"保存失败: {str(e)}", parent=self.window())
 
     def on_customer_double_clicked(self, item):
         cid = int(self.cust_table.item(item.row(), 0).text())
@@ -925,7 +952,7 @@ class CustomerDetailDialog(QDialog):
         layout = QVBoxLayout(self)
         
         # 头部
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             res = conn.execute("SELECT name, level FROM customers WHERE id=?", (customer_id,)).fetchone()
             self.name = res[0]
             layout.addWidget(SubtitleLabel(f"档案项目: {res[0]} ({res[1]}级)"))
@@ -983,7 +1010,7 @@ class CustomerDetailDialog(QDialog):
     def delete_contact(self, contact_id):
         res = MessageBox("确定删除?", "即将物理移除该联系人档案，确认继续？", self)
         if res.exec():
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 conn.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
                 conn.commit()
             # 记录删除日志
@@ -995,7 +1022,7 @@ class CustomerDetailDialog(QDialog):
         self.table.setRowCount(0)
         # 响应式拉伸
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             cur = conn.execute("SELECT id, name, post, phone, role_type, birthday FROM contacts WHERE customer_id=?", (self.customer_id,))
             for r in cur:
                 idx = self.table.rowCount()
@@ -1024,7 +1051,7 @@ class CustomerDetailDialog(QDialog):
         role_cb.addItems(["经办人", "决策者", "影响者"])
         
         if contact_id:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 res = conn.execute("SELECT name, post, phone, role_type, birthday FROM contacts WHERE id=?", (contact_id,)).fetchone()
                 if res:
                     name.setText(res[0]); post.setText(res[1]); phone.setText(res[2])
@@ -1042,7 +1069,7 @@ class CustomerDetailDialog(QDialog):
         btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
         if dlg.exec():
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 if contact_id:
                     conn.execute("UPDATE contacts SET name=?, post=?, phone=?, role_type=?, birthday=? WHERE id=?",
                                 (name.text(), post.text(), phone.text(), role_cb.currentText(), bday.date().toString("yyyy-MM-dd"), contact_id))
@@ -1059,7 +1086,7 @@ class CustomerDetailDialog(QDialog):
 # ==========================================
 def get_next_project_no():
     prefix = datetime.now().strftime("%y%m%d")
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_db_conn() as conn:
         res = conn.execute("SELECT project_no FROM projects WHERE project_no LIKE ? ORDER BY project_no DESC LIMIT 1", (f"{prefix}%",)).fetchone()
         if res:
             seq = int(res[0][-2:]) + 1
@@ -1133,7 +1160,7 @@ class ProjectPage(QWidget):
         st = self.search_box.text().strip()
         try:
             self.table.setRowCount(0)
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 query = """
                     SELECT p.project_no, c.name, p.project_name, 
                            COALESCE(p.stage, '初期线索'), 
@@ -1197,7 +1224,7 @@ class ProjectPage(QWidget):
         cust_cb = ComboBox()
         cust_ids = []
         preselect_idx = -1
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             for i, r in enumerate(conn.execute("SELECT id, name FROM customers")):
                 cust_ids.append(r[0]); cust_cb.addItem(r[1])
                 if prefilled_customer and r[1] == prefilled_customer:
@@ -1227,17 +1254,17 @@ class ProjectPage(QWidget):
             if not name.text(): return
             p_no = get_next_project_no()
             cid = cust_ids[cust_cb.currentIndex()]
-            with sqlite3.connect(DB_NAME) as conn:
-                try:
+            try:
+                with get_db_conn() as conn:
                     conn.execute("INSERT INTO projects (project_no, customer_id, project_name, stage) VALUES (?,?,?,?)",
                                 (p_no, cid, name.text(), stage.currentText()))
-                    # [NEW] 审计记录
-                    log_action("项目跟进", "新立项", p_no, f"项目名: {name.text()}, 初始阶段: {stage.currentText()}")
-                except Exception as e:
-                    InfoBar.error("立项失败", f"数据库写入错误: {str(e)}", duration=3000, parent=self.window())
-                    return
-            self.load_projects()
-            InfoBar.success("立项成功", f"项目编号 {p_no} 已创建", duration=2000, parent=self.window())
+                    # 原子化日志记录
+                    log_action("项目跟进", "新立项", p_no, f"项目名: {name.text()}, 初始阶段: {stage.currentText()}", conn=conn)
+                    conn.commit()
+                self.load_projects()
+                InfoBar.success("立项成功", f"项目编号 {p_no} 已创建", duration=2000, parent=self.window())
+            except Exception as e:
+                InfoBar.error("立项失败", f"数据库写入错误: {str(e)}", duration=3000, parent=self.window())
 
     def show_context_menu(self, pos):
         from PyQt5.QtWidgets import QMenu
@@ -1295,7 +1322,7 @@ class ProjectDetailDialog(QDialog):
         self.p_name = "" 
         
         try:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 row = conn.execute("""
                     SELECT p.customer_id, p.stage, c.name, p.project_name FROM projects p 
                     JOIN customers c ON p.customer_id = c.id 
@@ -1380,7 +1407,7 @@ class ProjectDetailDialog(QDialog):
             if item.widget():
                 item.widget().deleteLater()
         
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             query = """
                 SELECT id, follow_date, contact_name, contact_method, follow_duration, stage, detail, next_plan 
                 FROM follow_ups WHERE project_no=? ORDER BY follow_date DESC, id DESC
@@ -1412,7 +1439,7 @@ class ProjectDetailDialog(QDialog):
     def delete_follow(self, follow_id):
         res = MessageBox("确定删除记录?", "即将永久移除此条跟进日志，操作无法撤销。确认吗？", self)
         if res.exec():
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 conn.execute("DELETE FROM follow_ups WHERE id=?", (follow_id,))
                 conn.commit()
             log_action("项目跟进", "删除跟进", self.project_no, f"记录ID: {follow_id}")
@@ -1434,7 +1461,7 @@ class ProjectDetailDialog(QDialog):
         if self.current_stage in stages: stage_cb.setCurrentText(self.current_stage)
         
         contact_cb = EditableComboBox()
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             contacts = conn.execute("SELECT name, phone FROM contacts WHERE customer_id=?", (self.customer_id,)).fetchall()
             for name, phone in contacts:
                 contact_cb.addItem(f"{name} ({phone})")
@@ -1463,7 +1490,7 @@ class ProjectDetailDialog(QDialog):
 
         # 如果是编辑模式，载入旧数据
         if edit_id:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 r = conn.execute("SELECT follow_date, contact_name, contact_method, follow_duration, stage, detail, next_plan FROM follow_ups WHERE id=?", (edit_id,)).fetchone()
                 if r:
                     date_e.setDate(QDate.fromString(r[0], "yyyy-MM-dd"))
@@ -1476,7 +1503,7 @@ class ProjectDetailDialog(QDialog):
         else:
             # 智能继承：自动填充最后一次录入的联系人和方式
             try:
-                with sqlite3.connect(DB_NAME) as conn:
+                with get_db_conn() as conn:
                     last_r = conn.execute("SELECT contact_name, contact_method FROM follow_ups WHERE project_no=? ORDER BY id DESC LIMIT 1", (self.project_no,)).fetchone()
                     if last_r:
                         contact_cb.setCurrentText(last_r[0])
@@ -1518,30 +1545,31 @@ class ProjectDetailDialog(QDialog):
             v_str = visit_date.date.toString("yyyy-MM-dd")
             try: dur = int(duration_le.text() or 0)
             except: dur = 0
-            
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
-                if edit_id:
-                    conn.execute("UPDATE follow_ups SET follow_date=?, contact_name=?, contact_method=?, follow_duration=?, stage=?, detail=?, next_plan=? WHERE id=?",
-                                (d_str, contact_cb.currentText(), method_cb.currentText(), dur, new_stage, detail.toPlainText(), plan.text(), edit_id))
-                else:
-                    conn.execute("INSERT INTO follow_ups (project_no, follow_date, contact_name, contact_method, follow_duration, stage, detail, next_plan) VALUES (?,?,?,?,?,?,?,?)",
-                                (self.project_no, d_str, contact_cb.currentText(), method_cb.currentText(), dur, new_stage, detail.toPlainText(), plan.text()))
-                
-                # 更新项目状态 (同步发射全局信号)
-                if new_stage in ["已成交", "已流失"]:
-                    conn.execute("UPDATE projects SET stage=?, next_visit_date=NULL, loss_reason=? WHERE project_no=?",
-                                (new_stage, loss_reason_input.text() if new_stage=="已流失" else None, self.project_no))
-                else:
-                    conn.execute("UPDATE projects SET stage=?, next_visit_date=?, loss_reason=NULL WHERE project_no=?",
-                                (new_stage, v_str, self.project_no))
-                
-                self.current_stage = new_stage
-                conn.commit()
-                # 日志审计
-                log_action("项目跟进", "修改跟进" if edit_id else "新增跟进", self.project_no, 
-                           f"面会人: {contact_cb.currentText()}, 阶段: {new_stage}, 详情: {detail.toPlainText()[:30]}...")
-            
-            self.load_follows()
+            try:
+                with get_db_conn() as conn:
+                    if edit_id:
+                        conn.execute("UPDATE follow_ups SET follow_date=?, contact_name=?, contact_method=?, follow_duration=?, stage=?, detail=?, next_plan=? WHERE id=?",
+                                    (d_str, contact_cb.currentText(), method_cb.currentText(), dur, new_stage, detail.toPlainText(), plan.text(), edit_id))
+                    else:
+                        conn.execute("INSERT INTO follow_ups (project_no, follow_date, contact_name, contact_method, follow_duration, stage, detail, next_plan) VALUES (?,?,?,?,?,?,?,?)",
+                                    (self.project_no, d_str, contact_cb.currentText(), method_cb.currentText(), dur, new_stage, detail.toPlainText(), plan.text()))
+                    
+                    # 更新项目状态 (同步发射全局信号)
+                    if new_stage in ["已成交", "已流失"]:
+                        conn.execute("UPDATE projects SET stage=?, next_visit_date=NULL, loss_reason=? WHERE project_no=?",
+                                    (new_stage, loss_reason_input.text() if new_stage=="已流失" else None, self.project_no))
+                    else:
+                        conn.execute("UPDATE projects SET stage=?, next_visit_date=?, loss_reason=NULL WHERE project_no=?",
+                                    (new_stage, v_str, self.project_no))
+                    
+                    self.current_stage = new_stage
+                    # 原子化日志记录
+                    log_action("项目跟进", "修改跟进" if edit_id else "新增跟进", self.project_no, 
+                               f"面会人: {contact_cb.currentText()}, 阶段: {new_stage}, 详情: {detail.toPlainText()[:30]}...", conn=conn)
+                    conn.commit()
+                self.load_follows()
+            except Exception as e:
+                InfoBar.error("同步失败", f"数据库写入错误: {str(e)}", duration=3000, parent=self.window())
             SIGNAL_BUS.projectChanged.emit() # 全局刷新信号
             InfoBar.success("已更新", "跟进数据已同步至云端" if not edit_id else "记录已修正", duration=2000)
 
@@ -1557,7 +1585,7 @@ class ProjectDetailDialog(QDialog):
 
     def load_project_quotes(self):
         self.quote_table.setRowCount(0)
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             # 引入 remark 以便编辑时透传数据
             cur = conn.execute("SELECT quote_date, version, amount, file_path, remark FROM quotations WHERE project_no=? ORDER BY quote_date DESC", (self.project_no,))
             for r in cur:
@@ -1609,7 +1637,7 @@ class ProjectDetailDialog(QDialog):
         """物理删除项目详情中的特定报价"""
         res = MessageBox("确定删除记录?", f"即将永久移除项目 [{p_no}] 的版本 [{ver}]。确认吗？", self)
         if res.exec():
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 conn.execute("DELETE FROM quotations WHERE project_no=? AND version=?", (p_no, ver))
                 conn.commit()
             log_action("报价管理", "删除报价(详情页)", p_no, f"版本: {ver}")
@@ -1677,7 +1705,7 @@ class ProjectDetailDialog(QDialog):
         self.load_project_finance()
 
     def load_project_finance(self):
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             # 1. 载入合同基础信息
             contract = conn.execute("SELECT COALESCE(start_date, ''), COALESCE(end_date, ''), COALESCE(total_amount, 0.0), COALESCE(contract_memo, '') FROM contracts WHERE project_no=?", (self.project_no,)).fetchone()
             if contract:
@@ -1752,7 +1780,7 @@ class ProjectDetailDialog(QDialog):
         """删除回款记录"""
         res = MessageBox("确定删除?", "财务数据删除后无法找回，确认移除此项记录?", self.window())
         if res.exec():
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 conn.execute("DELETE FROM payment_plans WHERE id=?", (plan_id,))
                 conn.commit()
             # [NEW] 记录审计日志
@@ -1776,7 +1804,7 @@ class ProjectDetailDialog(QDialog):
         
         # [NEW] 如果是编辑模式，预填数据
         if edit_id:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 r = conn.execute("SELECT plan_date, plan_amount, actual_amount, status, remark FROM payment_plans WHERE id=?", (edit_id,)).fetchone()
                 if r:
                     p_date.setDate(QDate.fromString(r[0], "yyyy-MM-dd"))
@@ -1809,7 +1837,7 @@ class ProjectDetailDialog(QDialog):
                 aa = float(a_amt.text() or 0)
                 if status.currentText() == "已收" and aa == 0: aa = pa # 快捷处理
                 
-                with sqlite3.connect(DB_NAME, timeout=10) as conn:
+                with get_db_conn(timeout=10) as conn:
                     if edit_id:
                         conn.execute("UPDATE payment_plans SET plan_date=?, plan_amount=?, actual_amount=?, status=?, remark=? WHERE id=?",
                                     (p_date.date.toString("yyyy-MM-dd"), pa, aa, status.currentText(), remark.text(), edit_id))
@@ -1871,7 +1899,7 @@ class QuotationPage(QWidget):
             
             # [原子化渲染 第一步]：在连接保持期间仅读取数据
             rows = []
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 query = """
                     SELECT c.name, p.project_name, q.project_no, q.quote_date, q.version, 
                            COALESCE(q.amount, 0.0), COALESCE(q.file_path, ''), COALESCE(q.remark, '')
@@ -1994,7 +2022,7 @@ class QuotationPage(QWidget):
         """物理移除报价记录"""
         res = MessageBox("确定删除?", f"即将永久移除项目 [{p_no}] 的版本 [{ver}] 的报价记录。确认操作?", self.window())
         if res.exec():
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 conn.execute("DELETE FROM quotations WHERE project_no=? AND version=?", (p_no, ver))
                 conn.commit()
             # 移出 with 块后执行日志和刷新
@@ -2038,7 +2066,7 @@ class QuotationPage(QWidget):
         # 复制或编辑模式下，需要定位关联项目
         target_p_no = edit_data['p_no'] if edit_data else (copy_data['p_no'] if copy_data else None)
         
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             for i, r in enumerate(conn.execute("SELECT project_no, project_name FROM projects")):
                 proj_nos.append(r[0]); proj_cb.addItem(f"[{r[0]}] {r[1]}")
                 if target_p_no and r[0] == target_p_no:
@@ -2071,7 +2099,7 @@ class QuotationPage(QWidget):
             # 自动生成后续版本号
             def refresh_ver():
                 p_no_val = proj_nos[proj_cb.currentIndex()]
-                with sqlite3.connect(DB_NAME, timeout=10) as conn:
+                with get_db_conn(timeout=10) as conn:
                     count = conn.execute("SELECT COUNT(*) FROM quotations WHERE project_no=?", (p_no_val,)).fetchone()[0]
                     ver.setText(f"V{count + 1}")
             proj_cb.currentIndexChanged.connect(refresh_ver)
@@ -2080,7 +2108,7 @@ class QuotationPage(QWidget):
             # 自动版本号逻辑 (纯新增)
             def auto_set_version():
                 p_no_val = proj_nos[proj_cb.currentIndex()]
-                with sqlite3.connect(DB_NAME, timeout=10) as conn:
+                with get_db_conn(timeout=10) as conn:
                     count = conn.execute("SELECT COUNT(*) FROM quotations WHERE project_no=?", (p_no_val,)).fetchone()[0]
                     ver.setText(f"V{count + 1}")
             proj_cb.currentIndexChanged.connect(auto_set_version)
@@ -2139,7 +2167,7 @@ class QuotationPage(QWidget):
             p_no_val = proj_nos[proj_cb.currentIndex()]
             v_val = ver.text().strip()
             if not edit_data:
-                with sqlite3.connect(DB_NAME) as conn:
+                with get_db_conn() as conn:
                     exists = conn.execute("SELECT 1 FROM quotations WHERE project_no=? AND version=?", (p_no_val, v_val)).fetchone()
                     if exists:
                         InfoBar.warning("版本冲突", f"项目 [{p_no_val}] 已存有版本 [{v_val}]，请微调版本号", parent=self)
@@ -2165,7 +2193,7 @@ class QuotationPage(QWidget):
                     print(f"File copy error: {e}")
 
             # [重构]：将数据库写入与审计日志分离，防止嵌套连接引发的 disk I/O error
-            with sqlite3.connect(DB_NAME, timeout=15) as conn:
+            with get_db_conn(timeout=15) as conn:
                 if edit_data:
                     conn.execute("UPDATE quotations SET quote_date=?, amount=?, remark=?, file_path=? WHERE project_no=? AND version=?",
                                 (date_e.date.toString("yyyy-MM-dd"), val_amt, remark.toPlainText(), final_path, p_no_val, v_val))
@@ -2229,7 +2257,7 @@ class ContractPage(QWidget):
         try:
             # [原子化渲染 第一步]：仅读取数据
             rows = []
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            with get_db_conn(timeout=10) as conn:
                 # 升级 SQL：增加客户名称关联，并实时通过子查询计算已收金额
                 query = """
                     SELECT c.project_no, cust.name as customer_name,
@@ -2344,7 +2372,7 @@ class ContractPage(QWidget):
         res = MessageBox("确定删除合同?", f"即将删除项目 [{p_no}] 的合同记录。注意：这不会删除项目本身，但会清空此合同的所有回款概况。确认继续？", self.window())
         if res.exec():
             try:
-                with sqlite3.connect(DB_NAME, timeout=15) as conn:
+                with get_db_conn(timeout=15) as conn:
                     conn.execute("DELETE FROM contracts WHERE project_no=?", (p_no,))
                     conn.commit()
                 # 移出事务块后记录日志和刷新
@@ -2386,7 +2414,7 @@ class ContractPage(QWidget):
         if is_edit:
             sql_proj += f" WHERE project_no='{project_no}'"
 
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_db_conn() as conn:
             for i, r in enumerate(conn.execute(sql_proj)):
                 proj_nos.append(r[0])
                 proj_cb.addItem(f"[{r[0]}] {r[1]}")
@@ -2413,7 +2441,7 @@ class ContractPage(QWidget):
         
         # [NEW] 编辑模式加载旧数据
         if is_edit:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 r = conn.execute("SELECT start_date, end_date, total_amount, file_path, contract_memo FROM contracts WHERE project_no=?", (project_no,)).fetchone()
                 if r:
                     start.setDate(QDate.fromString(r[0], "yyyy-MM-dd"))
@@ -2486,8 +2514,8 @@ class ContractPage(QWidget):
                     except: final_path = self.c_file
                 else: final_path = self.c_file
 
-            with sqlite3.connect(DB_NAME) as conn:
-                try:
+            try:
+                with get_db_conn() as conn:
                     val_total = float(total.text() or 0)
                     dt_s = start.date.toString("yyyy-MM-dd")
                     dt_e = end.date.toString("yyyy-MM-dd")
@@ -2501,13 +2529,14 @@ class ContractPage(QWidget):
                                     (p_no, dt_s, dt_e, val_total, val_paid, final_path, memo.toPlainText()))
                         if val_paid > 0:
                             conn.execute("INSERT INTO payment_plans (project_no, plan_date, plan_amount, actual_amount, status, remark) VALUES (?,?,?,?,'已收','合同首付款登记')", (p_no, dt_s, val_paid, val_paid))
+                    
+                    # 原子化日志记录
+                    log_action("生效合同", "修改合同" if is_edit else "签约登记", p_no, f"总额: {val_total}", conn=conn)
                     conn.commit()
-                    log_action("生效合同", "修改合同" if is_edit else "签约登记", p_no, f"总额: {val_total}, 首付: {val_paid if not is_edit else 'N/A'}")
-                except Exception as e:
-                    InfoBar.error("操作失败", f"数据库写入错误: {str(e)}", duration=3000, parent=self.window())
-                    return
-            self.load_contracts()
-            InfoBar.success("操作成功", "合同档案已同步更新" if is_edit else f"项目 {p_no} 签约资料已入库", duration=3000, parent=self.window())
+                self.load_contracts()
+                InfoBar.success("操作成功", "合同档案已同步更新" if is_edit else f"项目 {p_no} 签约资料已入库", duration=3000, parent=self.window())
+            except Exception as e:
+                InfoBar.error("操作失败", f"数据库写入错误: {str(e)}", duration=3000, parent=self.window())
 
     def select_c_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "All Files (*)")
@@ -2518,7 +2547,7 @@ class ContractPage(QWidget):
 # ==========================================
 def ensure_columns():
     """数据库“查体医生”：确保所有必备字段存在，防止热更新导致的崩溃"""
-    with sqlite3.connect(DB_NAME, timeout=10) as conn:
+    with get_db_conn(timeout=10) as conn:
         cursor = conn.cursor()
         
         # 辅助函数：安全添加字段
@@ -2612,7 +2641,7 @@ class LogPage(QWidget):
         try:
             st = self.search_box.text().strip()
             self.table.setRowCount(0)
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 query = """
                     SELECT timestamp, module, action_type, target_id, details 
                     FROM action_logs 
@@ -2685,7 +2714,7 @@ class BackupManager:
     def get_project_count():
         """统计项目数，用于备份文件名生成"""
         try:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 res = conn.execute("SELECT COUNT(*) FROM projects").fetchone()
                 return res[0] if res else 0
         except: return 0
@@ -2815,7 +2844,7 @@ class BackupPage(QWidget):
 
     def get_note_from_logs(self, file_name):
         try:
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 res = conn.execute("SELECT details FROM action_logs WHERE target_id=? AND action_type IN ('数据备份', '自动存档') LIMIT 1", (file_name,)).fetchone()
                 return res[0] if res else "系统快照"
         except: return "未知"
@@ -2910,7 +2939,7 @@ class MainWindow(FluentWindow):
         try:
             today_ts = datetime.now().strftime("%Y%m%d")
             # 简单查重：通过日志判断今日是否已自动备份过
-            with sqlite3.connect(DB_NAME) as conn:
+            with get_db_conn() as conn:
                 res = conn.execute("SELECT id FROM action_logs WHERE action_type='自动存档' AND timestamp LIKE ?", (f"{datetime.now().strftime('%Y-%m-%d')}%",)).fetchone()
                 if not res:
                     BackupManager.create_backup("软件退出自动存档", is_auto=True)
