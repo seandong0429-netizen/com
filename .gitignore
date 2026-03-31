@@ -14,7 +14,14 @@ venv.bak/
 
 # SQLite databases
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
+
+# Local storage and logs
+backups/
+attachments/
+*.csv
 
 # OS generated files
 .DS_Store
