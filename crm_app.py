@@ -108,11 +108,11 @@ def init_db():
             "customers": "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, industry TEXT, level TEXT, address TEXT",
             "contacts": "id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER, name TEXT, post TEXT, dept TEXT, phone TEXT, email TEXT, birthday TEXT, is_decision_maker INTEGER, role_type TEXT DEFAULT '经办人', FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE",
             "suppliers": "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, category TEXT, contact_person TEXT, phone TEXT, note TEXT",
-            "projects": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT UNIQUE, customer_id INTEGER, project_name TEXT, stage TEXT DEFAULT '初期线索', loss_reason TEXT, next_visit_date TEXT, next_plan TEXT, FOREIGN KEY (customer_id) REFERENCES customers(id)",
-            "follow_ups": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, follow_date TEXT, contact_name TEXT, contact_method TEXT DEFAULT '电话', follow_duration INTEGER DEFAULT 0, stage TEXT, detail TEXT, next_plan TEXT, FOREIGN KEY(project_no) REFERENCES projects(project_no)",
-            "quotations": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, quote_date TEXT, amount REAL, file_path TEXT, version TEXT, remark TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no)",
-            "contracts": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, start_date TEXT, end_date TEXT, total_amount REAL, paid_amount REAL DEFAULT 0.0, file_path TEXT, contract_memo TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no)",
-            "payment_plans": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, plan_date TEXT, plan_amount REAL, actual_amount REAL DEFAULT 0.0, status TEXT DEFAULT '待收', remark TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no)",
+            "projects": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT UNIQUE, customer_id INTEGER, project_name TEXT, stage TEXT DEFAULT '初期线索', loss_reason TEXT, next_visit_date TEXT, next_plan TEXT, FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE",
+            "follow_ups": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, follow_date TEXT, contact_name TEXT, contact_method TEXT DEFAULT '电话', follow_duration INTEGER DEFAULT 0, stage TEXT, detail TEXT, next_plan TEXT, FOREIGN KEY(project_no) REFERENCES projects(project_no) ON DELETE CASCADE",
+            "quotations": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, quote_date TEXT, amount REAL, file_path TEXT, version TEXT, remark TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no) ON DELETE CASCADE",
+            "contracts": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, start_date TEXT, end_date TEXT, total_amount REAL, paid_amount REAL DEFAULT 0.0, file_path TEXT, contract_memo TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no) ON DELETE CASCADE",
+            "payment_plans": "id INTEGER PRIMARY KEY AUTOINCREMENT, project_no TEXT, plan_date TEXT, plan_amount REAL, actual_amount REAL DEFAULT 0.0, status TEXT DEFAULT '待收', remark TEXT, FOREIGN KEY (project_no) REFERENCES projects(project_no) ON DELETE CASCADE",
             "action_logs": "id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, module TEXT, action_type TEXT, target_id TEXT, details TEXT"
         }
         for name, schema in tables.items():
@@ -335,8 +335,8 @@ class DashboardPage(QWidget):
         self.todo_expand_btn.clicked.connect(self.toggle_todo_table)
         
         self.todo_expand_table = TableWidget(self.today_task_card)
-        self.todo_expand_table.setColumnCount(3)
-        self.todo_expand_table.setHorizontalHeaderLabels(["项目名称", "下一步计划", "执行日期"])
+        self.todo_expand_table.setColumnCount(4)
+        self.todo_expand_table.setHorizontalHeaderLabels(["客户", "项目名称", "下一步计划", "执行日期"])
         self.todo_expand_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.todo_expand_table.setFixedHeight(200)
         self.todo_expand_table.hide()
@@ -479,30 +479,32 @@ class DashboardPage(QWidget):
                         return
                     t.setRowCount(0)
                 
-                # 6. 获取所有待办记录 (合并后的核心逻辑)
+                # 6. 获取所有待办记录 (只显示档案库中真实存在的客户项目，并增加客户名称)
                 todos = conn.execute("""
-                    SELECT project_name, next_plan, next_visit_date, project_no 
-                    FROM projects 
-                    WHERE (loss_reason IS NULL OR loss_reason='') 
-                      AND (stage != '已成交') 
-                      AND next_visit_date IS NOT NULL 
-                    ORDER BY next_visit_date ASC LIMIT 15
+                    SELECT p.project_name, p.next_plan, p.next_visit_date, p.project_no, c.name
+                    FROM projects p
+                    JOIN customers c ON p.customer_id = c.id
+                    WHERE (p.loss_reason IS NULL OR p.loss_reason='') 
+                      AND (p.stage != '已成交') 
+                      AND p.next_visit_date IS NOT NULL 
+                    ORDER BY p.next_visit_date ASC LIMIT 15
                 """).fetchall()
                 
                 if todos:
-                    # 6.1 更新核心大卡片内容（显示最紧急的一条）
-                    n, p, d, pno = todos[0]
+                    # 6.1 更新核心大卡片内容（增加客户维度展示，防重名）
+                    n, p, d, pno, cust_n = todos[0]
                     # 判空显示修复
                     disp_plan = str(p or "").strip() or "需尽快明确下一步动作"
-                    self.tt_content.setText(f"项目: {n}\n计划: {disp_plan}\n日期: {d}")
+                    self.tt_content.setText(f"客户: {cust_n}\n项目: {n}\n计划: {disp_plan}\n日期: {d}")
                     
-                    # 6.2 填充折叠表格（全量显示）
-                    for n, p, d, pno in todos:
+                    # 6.2 填充折叠表格（全量显示，增加列）
+                    for n, p, d, pno, cust_n in todos:
                         ix = self.todo_expand_table.rowCount(); self.todo_expand_table.insertRow(ix)
                         disp_plan = str(p or "").strip() or "需尽快明确下一步动作"
-                        data = [n, disp_plan, d]
+                        data = [cust_n, n, disp_plan, d]
                         for i, v in enumerate(data):
                             it = QTableWidgetItem(str(v))
+                            # 挂载项目编号用于双击跳转
                             it.setData(Qt.UserRole, pno)
                             self.todo_expand_table.setItem(ix, i, it)
                     
@@ -676,6 +678,7 @@ class MasterDataPage(QWidget):
         self.cust_table.setColumnWidth(0, 60)
         self.cust_table.setColumnWidth(2, 100)
         self.cust_table.setColumnWidth(3, 80)
+        self.cust_table.setColumnWidth(5, 160) # 调宽操作列以容纳 4 个按钮
         self.cust_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.cust_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch) # 地址拉长
         
@@ -730,11 +733,16 @@ class MasterDataPage(QWidget):
                 self.add_customer_actions(idx, r[0], r[1])
 
     def add_customer_actions(self, row, cust_id, cust_name):
-        """添加 [👤 查看/联系] 与 [🚀 快速立项] 按钮"""
+        """添加 [✏️ 修改] [🗑️ 删除] [👤 查看/联系] 与 [🚀 快速立项] 按钮"""
         container = QWidget()
         layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(5, 0, 5, 0)
+        layout.setSpacing(8)
+        
+        # ✏️ 修改按钮
+        btn_edit = TransparentToolButton(FIF.EDIT, container)
+        btn_edit.setToolTip("修改此客户基本信息")
+        btn_edit.clicked.connect(lambda: self.show_edit_customer(cust_id))
         
         # 👤 预览联系人按钮
         contact_btn = TransparentToolButton(FIF.PEOPLE, container)
@@ -746,10 +754,92 @@ class MasterDataPage(QWidget):
         project_btn.setToolTip("对此客户一键开启新立项")
         project_btn.clicked.connect(lambda: self.quick_create_project(cust_name))
         
+        # 🗑️ 删除按钮
+        btn_del = TransparentToolButton(FIF.DELETE, container)
+        btn_del.setToolTip("永久删除客户档案")
+        btn_del.clicked.connect(lambda: self.confirm_delete_customer(cust_id, cust_name))
+        
+        layout.addWidget(btn_edit)
         layout.addWidget(contact_btn)
         layout.addWidget(project_btn)
+        layout.addWidget(btn_del)
         layout.addStretch()
         self.cust_table.setCellWidget(row, 5, container)
+
+    def confirm_delete_customer(self, cust_id, cust_name):
+        """深度安全删除客户逻辑：确保物理级联清理"""
+        res = MessageBox("确定永久删除客户?", f"即将移除客户 [{cust_name}]。这将同步永久删除该客户下所有的：\n1. 联系人矩阵\n2. 销售项目\n3. 跟进记录与待办\n4. 报价与合同资料\n\n此操作不可撤销，确认吗？", self.window())
+        if res.exec():
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                # 1. 识别该客户名下的所有项目编号
+                p_nos = [r[0] for r in conn.execute("SELECT project_no FROM projects WHERE customer_id=?", (cust_id,)).fetchall()]
+                
+                # 2. 手动清理关联业务数据 (针对未启用物理级联约束的旧库)
+                for p_no in p_nos:
+                    conn.execute("DELETE FROM follow_ups WHERE project_no=?", (p_no,))
+                    conn.execute("DELETE FROM quotations WHERE project_no=?", (p_no,))
+                    conn.execute("DELETE FROM contracts WHERE project_no=?", (p_no,))
+                    conn.execute("DELETE FROM payment_plans WHERE project_no=?", (p_no,))
+                
+                # 3. 删除项目与联系人
+                conn.execute("DELETE FROM projects WHERE customer_id=?", (cust_id,))
+                conn.execute("DELETE FROM contacts WHERE customer_id=?", (cust_id,))
+                
+                # 4. 最后删除客户主体
+                conn.execute("DELETE FROM customers WHERE id=?", (cust_id,))
+                conn.commit()
+            
+            # [核心修复] 发送到信号总线：强制看板、待办、项目页同步刷新
+            SIGNAL_BUS.projectChanged.emit() 
+            
+            log_action("基础档案", "深度删除客户", cust_name, f"ID: {cust_id}")
+            self.load_customers() # 刷新本页列表
+            InfoBar.success("深度清理完成", f"客户 {cust_name} 及其所有历史业务数据已从系统中彻底移除", duration=3000, parent=self.window())
+
+    def show_edit_customer(self, cust_id):
+        """弹出修改客户对话框"""
+        with sqlite3.connect(DB_NAME) as conn:
+            data = conn.execute("SELECT name, industry, level, address FROM customers WHERE id=?", (cust_id,)).fetchone()
+        
+        if not data: return
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle("修改客户档案")
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        
+        name = LineEdit(); name.setText(data[0])
+        industry = EditableComboBox(); industry.setText(data[1])
+        industry.addItems(["政府", "国企", "企业"])
+        
+        level = ComboBox()
+        level_items = ["A", "B", "C"]
+        level.addItems(["A (重点)", "B (普通)", "C (初触)"])
+        try: level.setCurrentIndex(level_items.index(data[2]))
+        except: pass
+        
+        addr = LineEdit(); addr.setText(data[3] or "")
+        
+        form.addRow("客户全称*:", name)
+        form.addRow("所属行业:", industry)
+        form.addRow("客户等级:", level)
+        form.addRow("联系地址:", addr)
+        layout.addLayout(form)
+        
+        btn = PrimaryPushButton("保存变更")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        
+        if dlg.exec():
+            if not name.text(): return
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute("UPDATE customers SET name=?, industry=?, level=?, address=? WHERE id=?",
+                            (name.text(), industry.currentText(), level.currentText()[0], addr.text(), cust_id))
+                conn.commit()
+            log_action("基础档案", "更新客户", name.text(), f"级别: {level.currentText()}")
+            self.load_customers()
+            InfoBar.success("已更新", f"客户 {name.text()} 资料已同步至数据库", duration=2000, parent=self.window())
 
     def show_customer_contacts(self, cust_id, cust_name):
         """弹出联系人决策矩阵对话框"""
