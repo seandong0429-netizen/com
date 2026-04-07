@@ -7,5 +7,5 @@ then
 fi
 
 echo "开始打包 CRM 系统..."
-pyinstaller --noconfirm --onefile --windowed --name "CRM_Pro" "crm_app.py"
+pyinstaller --noconfirm --onefile --windowed --icon="icon.ico" --name "CRM_Pro" "crm_app.py"
 echo "打包完成！"

@@ -303,6 +303,11 @@ class DashboardPage(QWidget):
         
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
+
+        # 【新增下面这两行】强制设置背景为纯白色
+        self.content_widget.setStyleSheet("background-color: white;")
+        self.scroll_area.setStyleSheet("QScrollArea { border: none; background-color: white; }")
+
         self.content_layout.setContentsMargins(30, 30, 30, 30)
         self.content_layout.setSpacing(25)
         
@@ -627,6 +632,17 @@ class MasterDataPage(QWidget):
         # 核心改进：卡片化容器包装 Pivot 和 StackedWidget
         self.container = CardWidget(self)
         self.container_layout = QVBoxLayout(self.container)
+
+        # 2. 创建 Pivot 和 StackedWidget (必须先创建它们！)
+        #self.pivot = Pivot(self.container)
+        #self.stacked = QStackedWidget(self.container) # <--- 这行是关键，必须在前面
+
+
+        # 【新增下面这两行】强制让卡片容器和内部视图变为白色
+        #self.container.setStyleSheet("background-color: white; border: 1px solid #e0e0e0; border-radius: 10px;")
+        #self.stacked.setStyleSheet("background-color: white;")
+
+
         self.container_layout.setContentsMargins(10, 10, 10, 10)
         
         self.pivot = Pivot(self.container)
@@ -2909,6 +2925,7 @@ class MainWindow(FluentWindow):
             sys.exit(1)
         
         self.setWindowTitle("CRM Enterprise - 单兵高管企业版")
+        self.setWindowIcon(QIcon("logo.png"))
         self.showMaximized() # 自动最大化适配屏幕
         setTheme(Theme.LIGHT)
         
