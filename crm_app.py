@@ -191,6 +191,9 @@ class BubbleCard(CardWidget):
     def __init__(self, follow_id, date_str, name, method, duration, stage, detail, parent=None):
         super().__init__(parent)
         self.follow_id = follow_id
+        # 【核心修复】设置唯一标识，配合 ID 选择器强制覆盖主题样式
+        self.setObjectName("BubbleCard")
+        self.setAttribute(Qt.WA_StyledBackground)
         
         # 整体采用水平布局，左侧放置时间轴线条，右侧放置内容
         main_h_layout = QHBoxLayout(self)
@@ -206,16 +209,28 @@ class BubbleCard(CardWidget):
         
         # --- 右侧：内容区域 ---
         content_widget = QWidget()
+        content_widget.setStyleSheet("background: transparent; border: none;") # 确保容器透明
         layout = QVBoxLayout(content_widget)
         layout.setContentsMargins(15, 12, 15, 12)
         layout.setSpacing(8)
         main_h_layout.addWidget(content_widget, 1)
         
-        # 视觉区分背景色
-        if method in ["方案演示", "面谈"]:
-            self.setStyleSheet("BubbleCard { background-color: #E8F5E9; border: 1px solid #C8E6C9; border-radius: 12px; }")
-        else:
-            self.setStyleSheet("BubbleCard { background-color: #F5FAFF; border: 1px solid #E3F2FD; border-radius: 12px; }")
+        # 视觉区分背景色并增强边框层次感
+        bg_color = "#E8F5E9" if method in ["方案演示", "面谈"] else "#E3F2FD"
+        border_color = "#81C784" if method in ["方案演示", "面谈"] else "#90CAF9"
+        
+        # 使用 ID 选择器 (#BubbleCard) 确保样式仅作用于容器本身，且具有最高优先级
+        self.setStyleSheet(f"""
+            #BubbleCard {{
+                background-color: {bg_color};
+                border: 1px solid {border_color};
+                border-radius: 12px;
+            }}
+            QLabel {{
+                background: transparent;
+                border: none;
+            }}
+        """)
         
         # 启用右键菜单
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -638,15 +653,14 @@ class MasterDataPage(QWidget):
         #self.stacked = QStackedWidget(self.container) # <--- 这行是关键，必须在前面
 
 
-        # 【新增下面这两行】强制让卡片容器和内部视图变为白色
-        #self.container.setStyleSheet("background-color: white; border: 1px solid #e0e0e0; border-radius: 10px;")
-        #self.stacked.setStyleSheet("background-color: white;")
-
-
         self.container_layout.setContentsMargins(10, 10, 10, 10)
         
         self.pivot = Pivot(self.container)
         self.stacked = QStackedWidget(self.container)
+
+        # 【修复：必须在组件创建后设置样式】强制让卡片容器和内部视图变为白色
+        self.container.setStyleSheet("background-color: white; border: 1px solid #e0e0e0; border-radius: 10px;")
+        self.stacked.setStyleSheet("background-color: white;")
         
         # 子界面
         self.customer_view = QWidget()
@@ -1358,6 +1372,8 @@ class ProjectDetailDialog(QDialog):
             QMessageBox.critical(self, "UI 加载失败", f"初次渲染详情页时崩溃: {e}")
             traceback.print_exc()
         print(f"DEBUG: 详情页初始化成功")
+        # 【去灰显白】强制设置弹窗整体为白色背景
+        self.setStyleSheet("background-color: white;")
 
     def init_ui(self):
         print("DEBUG: 开始加载 UI 组件")
@@ -1405,13 +1421,16 @@ class ProjectDetailDialog(QDialog):
         
         self.follow_scroll = ScrollArea()
         self.follow_scroll.setWidgetResizable(True)
-        self.follow_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         
         self.follow_container = QWidget()
         self.follow_layout = QVBoxLayout(self.follow_container)
         self.follow_layout.setAlignment(Qt.AlignTop)
         self.follow_layout.setSpacing(15)
         self.follow_scroll.setWidget(self.follow_container)
+        
+        # 【修复：去灰显白】强制跟进列表背景为白色
+        self.follow_scroll.setStyleSheet("QScrollArea { border: none; background-color: white; }")
+        self.follow_container.setStyleSheet("background-color: white;")
         
         layout.addWidget(self.follow_scroll, 1)
         self.load_follows()
@@ -2063,8 +2082,8 @@ class QuotationPage(QWidget):
                 main_window.navigationInterface.setCurrentItem(main_window.contract_page.objectName())
                 # 记录日志
                 log_action("报价管理", "转合同流转", p_no, f"金额: {amount}, 源报价: {os.path.basename(quote_file) if quote_file else 'N/A'}")
-                # 触发新增对话框并预填
-                main_window.contract_page.add_contract(p_no, amount, quote_file)
+                # 触发新增对话框并预填 (显式传递核心参数)
+                main_window.contract_page.add_contract(project_no=p_no, amount=amount, quote_file=quote_file)
             except Exception as e:
                 InfoBar.error("流转失败", f"无法自动切换页面: {str(e)}", parent=self)
 
@@ -2218,6 +2237,7 @@ class QuotationPage(QWidget):
                     conn.execute("INSERT INTO quotations (project_no, quote_date, amount, version, file_path, remark) VALUES (?,?,?,?,?,?)",
                                 (p_no_val, date_e.date.toString("yyyy-MM-dd"), val_amt, v_val, final_path, remark.toPlainText()))
                     action = "发布报价"
+                conn.commit()
             
             # 移出 with 块后执行日志和刷新
             log_action("报价管理", action, p_no_val, f"版本: {v_val}, 金额: {val_amt}")
@@ -2449,6 +2469,8 @@ class ContractPage(QWidget):
         start = CalendarPicker(); start.setDate(QDate.currentDate())
         end = CalendarPicker(); end.setDate(QDate.currentDate().addDays(365))
         total = LineEdit(); total.setPlaceholderText("合同总价值")
+        if amount is not None:
+            total.setText(str(amount))
         paid = LineEdit(); paid.setPlaceholderText("首付或已收金额 (仅在录入时生效)")
         if is_edit: paid.setDisabled(True) # 编辑模式下，首付通过回款模块维护
         
@@ -2498,6 +2520,11 @@ class ContractPage(QWidget):
         f_btn.clicked.connect(on_select_file)
         del_f_btn.clicked.connect(on_remove_file)
         file_layout.addWidget(f_btn, 1)
+        file_layout.addWidget(del_f_btn) # 添加删除按钮至布局
+        
+        # 【重点修复】如果从报价转合同传递了附件，立即同步 UI 状态
+        if self.c_file:
+            update_file_ui()
         file_layout.addWidget(del_f_btn)
         
         update_file_ui() # 初始化 UI 状态
