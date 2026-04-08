@@ -4,7 +4,16 @@ import sys
 import sqlite3
 import traceback
 import shutil
+import logging
 from datetime import datetime, date, timedelta
+
+# 全局日志配置（替代 print 输出，遵循工程规范）
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("crm")
 
 def get_app_dir():
     if getattr(sys, 'frozen', False):
@@ -19,11 +28,11 @@ def get_attachment_dir(sub_dir):
 # 拦截全局未捕获异常
 def exception_hook(exctype, value, tb):
     err_msg = "".join(traceback.format_exception(exctype, value, tb))
-    print(err_msg, flush=True)
+    logger.critical(err_msg)
     try:
         from PyQt5.QtWidgets import QMessageBox
         QMessageBox.critical(None, "程序崩溃", f"系统遇到致命错误：\n{err_msg[:500]}...")
-    except:
+    except Exception:
         pass
     sys.exit(1)
 
@@ -61,7 +70,7 @@ try:
     from qfluentwidgets import (FluentWindow, NavigationItemPosition, Theme, setTheme,
                                 CardWidget, BodyLabel, SubtitleLabel, TitleLabel, 
                                 TableWidget, PushButton, PrimaryPushButton, MessageBox,
-                                LineEdit, SearchLineEdit, ComboBox, EditableComboBox, DateEdit, TextEdit, Pivot, 
+                                LineEdit, SearchLineEdit, ComboBox, EditableComboBox, DateEdit, TextEdit, PlainTextEdit, Pivot, 
                                 InfoBar, InfoBarPosition, FluentIcon as FIF, ScrollArea,
                                 ToolButton, TransparentToolButton, ProgressBar, CalendarPicker)
 except ImportError:
@@ -133,15 +142,34 @@ def init_db():
         try:
             cursor.execute("DELETE FROM action_logs WHERE timestamp < datetime('now', '-90 days')")
             conn.commit()
-        except: pass
+        except Exception as e:
+            logger.warning(f"清理陈旧日志失败: {e}")
+
+        # 4. 添加高频查询索引以提升性能
+        index_stmts = [
+            "CREATE INDEX IF NOT EXISTS idx_projects_customer ON projects(customer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_projects_no ON projects(project_no)",
+            "CREATE INDEX IF NOT EXISTS idx_follow_ups_project ON follow_ups(project_no)",
+            "CREATE INDEX IF NOT EXISTS idx_follow_ups_date ON follow_ups(follow_date)",
+            "CREATE INDEX IF NOT EXISTS idx_quotations_project ON quotations(project_no)",
+            "CREATE INDEX IF NOT EXISTS idx_contracts_project ON contracts(project_no)",
+            "CREATE INDEX IF NOT EXISTS idx_payment_plans_project ON payment_plans(project_no)",
+            "CREATE INDEX IF NOT EXISTS idx_contacts_customer ON contacts(customer_id)",
+        ]
+        for stmt in index_stmts:
+            try:
+                cursor.execute(stmt)
+            except Exception as e:
+                logger.warning(f"索引创建跳过: {e}")
+        conn.commit()
 
         conn.close()
         
-        # 4. 彻底执行字段查体 (热更新双保险)
+        # 5. 彻底执行字段查体 (热更新双保险)
         ensure_columns()
         return True
     except Exception as e:
-        print(f"Database Init Error: {e}")
+        logger.error(f"Database Init Error: {e}")
         return False
 
 # ==========================================
@@ -165,7 +193,7 @@ def log_action(module, action_type, target_id, details="", conn=None):
                 standalone_conn.execute(sql, params)
                 standalone_conn.commit()
     except Exception as e:
-        print(f"Log Action Error (Module: {module}): {e}")
+        logger.error(f"Log Action Error (Module: {module}): {e}")
 
 # ==========================================
 # 辅助组件：KPI 卡片
@@ -292,15 +320,79 @@ class BubbleCard(CardWidget):
                 dialog.delete_follow(self.follow_id)
 
 # ==========================================
+# 客户管理对话框 (AddCustomerDialog)
+# ==========================================
+class AddCustomerDialog(QDialog):
+    def __init__(self, parent=None, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("新增客户档案" if not data else "修改客户档案")
+        self.resize(800, 650)
+        self.setStyleSheet("QDialog { background-color: white; }")
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+        
+        form = QFormLayout()
+        form.setSpacing(15)
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        
+        self.name = LineEdit()
+        self.name.setFixedWidth(550)
+        self.industry = EditableComboBox()
+        self.industry.setFixedWidth(550)
+        self.industry.addItems(["政府", "国企", "企业"])
+        self.level = ComboBox()
+        self.level.setFixedWidth(550)
+        self.level.addItems(["A (重点)", "B (普通)", "C (初触)"])
+        
+        # 联系地址支持自动换行与多行显示
+        self.address = PlainTextEdit()
+        self.address.setPlaceholderText("完整用户地址（支持换行）")
+        self.address.setFixedWidth(550)
+        self.address.setFixedHeight(100)
+        # 视觉优化
+        self.address.setStyleSheet("background: white; border: 1px solid #e0e0e0; border-radius: 4px;")
+
+        if data:
+            self.name.setText(data[0])
+            self.industry.setCurrentText(data[1])
+            level_items = ["A", "B", "C"]
+            try: self.level.setCurrentIndex(level_items.index(data[2]))
+            except Exception: pass
+            self.address.setPlainText(data[3] or "")
+
+        form.addRow("客户全称*:", self.name)
+        form.addRow("所属行业:", self.industry)
+        form.addRow("客户等级:", self.level)
+        form.addRow("联系地址:", self.address)
+        
+        layout.addLayout(form)
+        
+        self.save_btn = PrimaryPushButton("保存")
+        self.save_btn.clicked.connect(self.accept)
+        layout.addWidget(self.save_btn)
+
+    def get_data(self):
+        return (
+            self.name.text(),
+            self.industry.currentText(),
+            self.level.currentText()[0],
+            self.address.toPlainText()
+        )
+
+# ==========================================
 # 模块界面：经营看板 (Dashboard)
 # ==========================================
 class DashboardPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("DashboardPage")
+        self._dirty = True
         self.init_ui()
-        # 绑定全局信号：当项目状态或跟进变动时，自动刷新看板
-        SIGNAL_BUS.projectChanged.connect(self.load_data)
+        # 绑定全局信号：当项目状态或跟进变动时，标记脏数据并刷新看板
+        SIGNAL_BUS.projectChanged.connect(self._mark_dirty_and_load)
 
     def init_ui(self):
         # 0. 属性预定义 (安全占位，防止 AttributeError)
@@ -427,9 +519,22 @@ class DashboardPage(QWidget):
         count = self.todo_expand_table.rowCount()
         self.todo_expand_btn.setText(f"查看全部待办 ({count})")
 
+    def _mark_dirty_and_load(self):
+        """信号触发时标记脏数据，若当前可见则立即刷新"""
+        self._dirty = True
+        if self.isVisible():
+            self.load_data()
+            self._dirty = False
+
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(50, self.load_data)
+        if self._dirty:
+            QTimer.singleShot(50, self._deferred_load)
+
+    def _deferred_load(self):
+        """延迟加载数据并重置脏标记"""
+        self.load_data()
+        self._dirty = False
 
     def on_row_double_clicked(self, item):
         tw = item.tableWidget()
@@ -449,7 +554,7 @@ class DashboardPage(QWidget):
                 # 增强健壮性：优先检查关键表是否存在，防止 patch_db 未完成导致的崩溃
                 table_check = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='payment_plans'").fetchone()
                 if not table_check:
-                    print("DEBUG: payment_plans 表尚未就绪，跳过财务载入")
+                    logger.debug("payment_plans 表尚未就绪，跳过财务载入")
                     return
 
                 # 1. KPI 核心统计
@@ -507,7 +612,7 @@ class DashboardPage(QWidget):
                 target_tables = [self.todo_expand_table, self.red_list, self.orange_list, self.blue_list, self.visit_list]
                 for t in target_tables:
                     if t is None: 
-                        print("DEBUG: 发现未初始化的表格组件，跳过本次加载")
+                        logger.debug("发现未初始化的表格组件，跳过本次加载")
                         return
                     t.setRowCount(0)
                 
@@ -568,7 +673,7 @@ class DashboardPage(QWidget):
                             target.setItem(ix, 0, it)
                             target.setItem(ix, 1, QTableWidgetItem(proj))
                             target.setItem(ix, 2, QTableWidgetItem(f"{diff}天"))
-                    except: pass
+                    except Exception: pass
 
                 # 8. 近期拜访预警
                 v_30 = conn.execute("""
@@ -591,7 +696,7 @@ class DashboardPage(QWidget):
                             it_d = QTableWidgetItem(f"{diff}天")
                             if diff <= 7: it_d.setForeground(QColor("#e74c3c"))
                             self.visit_list.setItem(ix, 3, it_d)
-                    except: pass
+                    except Exception: pass
         except Exception as e:
             traceback.print_exc()
             self.remind_label.setText(f"数据加载异常: {str(e)}")
@@ -691,8 +796,10 @@ class MasterDataPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.load_customers()
-        self.load_suppliers()
+        if getattr(self, '_dirty', True):
+            self.load_customers()
+            self.load_suppliers()
+            self._dirty = False
 
     def init_customer_view(self):
         layout = QVBoxLayout(self.customer_view)
@@ -746,10 +853,13 @@ class MasterDataPage(QWidget):
         self.cust_table.setRowCount(0)
         with get_db_conn() as conn:
             sql = "SELECT id, name, industry, level, address FROM customers"
+            params = ()
             if keyword:
-                sql += f" WHERE name LIKE '%{keyword}%' OR industry LIKE '%{keyword}%'"
+                # 使用参数化查询防止 SQL 注入
+                sql += " WHERE name LIKE ? OR industry LIKE ?"
+                params = (f"%{keyword}%", f"%{keyword}%")
             
-            cur = conn.execute(sql)
+            cur = conn.execute(sql, params)
             for r in cur:
                 idx = self.cust_table.rowCount()
                 self.cust_table.insertRow(idx)
@@ -851,42 +961,18 @@ class MasterDataPage(QWidget):
         
         if not data: return
         
-        dlg = QDialog(self)
-        dlg.setWindowTitle("修改客户档案")
-        layout = QVBoxLayout(dlg)
-        form = QFormLayout()
-        
-        name = LineEdit(); name.setText(data[0])
-        industry = EditableComboBox(); industry.setText(data[1])
-        industry.addItems(["政府", "国企", "企业"])
-        
-        level = ComboBox()
-        level_items = ["A", "B", "C"]
-        level.addItems(["A (重点)", "B (普通)", "C (初触)"])
-        try: level.setCurrentIndex(level_items.index(data[2]))
-        except: pass
-        
-        addr = LineEdit(); addr.setText(data[3] or "")
-        
-        form.addRow("客户全称*:", name)
-        form.addRow("所属行业:", industry)
-        form.addRow("客户等级:", level)
-        form.addRow("联系地址:", addr)
-        layout.addLayout(form)
-        
-        btn = PrimaryPushButton("保存变更")
-        btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
-        
+        dlg = AddCustomerDialog(self, data)
         if dlg.exec():
-            if not name.text(): return
+            name, ind, lvl, addr = dlg.get_data()
+            if not name: return
             with get_db_conn() as conn:
                 conn.execute("UPDATE customers SET name=?, industry=?, level=?, address=? WHERE id=?",
-                            (name.text(), industry.currentText(), level.currentText()[0], addr.text(), cust_id))
+                            (name, ind, lvl, addr, cust_id))
+                # 原子化日志记录，确保与数据更新在同一事务内
+                log_action("基础档案", "更新客户", name, f"级别: {lvl}", conn=conn)
                 conn.commit()
-            log_action("基础档案", "更新客户", name.text(), f"级别: {level.currentText()}")
             self.load_customers()
-            InfoBar.success("已更新", f"客户 {name.text()} 资料已同步至数据库", duration=2000, parent=self.window())
+            InfoBar.success("已更新", f"客户 {name} 资料已同步至数据库", duration=2000, parent=self.window())
 
     def show_customer_contacts(self, cust_id, cust_name):
         """弹出联系人决策矩阵对话框"""
@@ -910,33 +996,19 @@ class MasterDataPage(QWidget):
                     self.supp_table.setItem(idx, i, QTableWidgetItem(str(v or "")))
 
     def show_add_customer(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("新增客户档案")
-        layout = QVBoxLayout(dlg)
-        form = QFormLayout()
-        name = LineEdit(); industry = EditableComboBox(); level = ComboBox(); addr = LineEdit()
-        industry.addItems(["政府", "国企", "企业"])
-        level.addItems(["A (重点)", "B (普通)", "C (初触)"])
-        form.addRow("客户全称*:", name)
-        form.addRow("所属行业:", industry)
-        form.addRow("客户等级:", level)
-        form.addRow("联系地址:", addr)
-        layout.addLayout(form)
-        btn = PrimaryPushButton("保存")
-        btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
-        
+        dlg = AddCustomerDialog(self)
         if dlg.exec():
-            if not name.text(): return
+            name, ind, lvl, addr = dlg.get_data()
+            if not name: return
             try:
                 with get_db_conn() as conn:
                     conn.execute("INSERT INTO customers (name, industry, level, address) VALUES (?,?,?,?)",
-                                (name.text(), industry.currentText(), level.currentText()[0], addr.text()))
+                                (name, ind, lvl, addr))
                     # 原子化日志记录
-                    log_action("基础档案", "新增客户", name.text(), f"级别: {level.currentText()}", conn=conn)
+                    log_action("基础档案", "新增客户", name, f"级别: {lvl}", conn=conn)
                     conn.commit()
                 self.load_customers()
-                InfoBar.success("保存成功", f"客户 {name.text()} 已入库", duration=2000, parent=self.window())
+                InfoBar.success("保存成功", f"客户 {name} 已入库", duration=2000, parent=self.window())
             except Exception as e:
                 InfoBar.error("错误", f"保存失败: {str(e)}", parent=self.window())
 
@@ -1050,8 +1122,6 @@ class CustomerDetailDialog(QDialog):
 
     def load_contacts(self):
         self.table.setRowCount(0)
-        # 响应式拉伸
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         with get_db_conn() as conn:
             cur = conn.execute("SELECT id, name, post, phone, role_type, birthday FROM contacts WHERE customer_id=?", (self.customer_id,))
             for r in cur:
@@ -1071,6 +1141,8 @@ class CustomerDetailDialog(QDialog):
                             item.setFont(font)
                             item.setForeground(QColor("#c0392b"))
                     self.table.setItem(idx, i, item)
+        # 响应式拉伸 (移到循环外以提升布局计算性能)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
     def add_contact(self, contact_id=None):
         dlg = QDialog(self)
@@ -1103,11 +1175,12 @@ class CustomerDetailDialog(QDialog):
                 if contact_id:
                     conn.execute("UPDATE contacts SET name=?, post=?, phone=?, role_type=?, birthday=? WHERE id=?",
                                 (name.text(), post.text(), phone.text(), role_cb.currentText(), bday.date().toString("yyyy-MM-dd"), contact_id))
-                    log_action("联系人", "修改联系人", name.text(), f"职位: {post.text()}, 客户: {self.name}")
+                    log_action("联系人", "修改联系人", name.text(), f"职位: {post.text()}, 客户: {self.name}", conn=conn)
                 else:
                     conn.execute("INSERT INTO contacts (customer_id, name, post, phone, role_type, birthday) VALUES (?,?,?,?,?,?)",
                                 (self.customer_id, name.text(), post.text(), phone.text(), role_cb.currentText(), bday.date().toString("yyyy-MM-dd")))
-                    log_action("联系人", "新增联系人", name.text(), f"职位: {post.text()}, 客户: {self.name}")
+                    log_action("联系人", "新增联系人", name.text(), f"职位: {post.text()}, 客户: {self.name}", conn=conn)
+                conn.commit()
             self.load_contacts()
             InfoBar.success("已更新", "联系人档案操作成功", duration=2000, parent=self)
 
@@ -1173,18 +1246,19 @@ class ProjectPage(QWidget):
         self.add_btn.clicked.connect(self.add_project)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         
-        # 多重事件监听，解决部分平台信号丢失问题
+        # NOTE: 仅保留双击事件，移除 cellClicked 绑定以避免单击就弹窗
         self.table.cellDoubleClicked.connect(self.on_cell_double_click)
-        self.table.cellClicked.connect(self.on_cell_double_click)
         
         # 绑定全局信号：当项目状态或跟进变动时，自动刷新列表
-        SIGNAL_BUS.projectChanged.connect(self.load_projects)
+        SIGNAL_BUS.projectChanged.connect(lambda: setattr(self, '_dirty', True))
         
         self.load_projects()
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.load_projects()
+        if getattr(self, '_dirty', True):
+            self.load_projects()
+            self._dirty = False
 
     def load_projects(self):
         st = self.search_box.text().strip()
@@ -1311,7 +1385,7 @@ class ProjectPage(QWidget):
             self.show_detail(p_no)
 
     def view_selected_detail(self):
-        print("DEBUG: 点击工具栏查看详情按钮", flush=True)
+        logger.debug("点击工具栏查看详情按钮")
         row = self.table.currentRow()
         if row < 0:
             InfoBar.warning("请选择项目", "请先在列表中选中一个项目进行查看", duration=2000, parent=self)
@@ -1321,14 +1395,14 @@ class ProjectPage(QWidget):
         if p_no: self.show_detail(p_no)
 
     def on_cell_double_click(self, row, col):
-        print(f"DEBUG: 监测到点击事件 [Row: {row}, Col: {col}]", flush=True)
+        logger.debug(f"监测到点击事件 [Row: {row}, Col: {col}]")
         it = self.table.item(row, 0)
         p_no = it.text() if it else ""
         if p_no:
             self.show_detail(p_no)
 
     def show_detail(self, p_no):
-        print(f"DEBUG: 命中详情加载逻辑: {p_no}", flush=True)
+        logger.debug(f"命中详情加载逻辑: {p_no}")
         # 立即给予视觉反馈
         InfoBar.info("正在加载", f"正在打开项目 {p_no} 的全量看板...", duration=1000, parent=self.window())
         
@@ -1336,14 +1410,14 @@ class ProjectPage(QWidget):
             dlg = ProjectDetailDialog(p_no, self)
             dlg.exec()
         except Exception as e:
-            print(f"DEBUG: 对话框启动失败: {e}", flush=True)
+            logger.error(f"对话框启动失败: {e}")
             traceback.print_exc()
             InfoBar.error("加载失败", f"无法初始化详情看板: {str(e)}", duration=3000, parent=self.window())
 
 class ProjectDetailDialog(QDialog):
     def __init__(self, project_no, parent=None, start_tab="follows"):
         super().__init__(parent)
-        print(f"DEBUG: 初始化项目详情 [{project_no}]，初始标签: {start_tab}")
+        logger.debug(f"初始化项目详情 [{project_no}]，初始标签: {start_tab}")
         self.project_no = project_no
         self.start_tab = start_tab
         self.customer_id = None
@@ -1359,9 +1433,9 @@ class ProjectDetailDialog(QDialog):
                     WHERE p.project_no=?""", (project_no,)).fetchone()
                 if row:
                     self.customer_id, self.current_stage, self.customer_name, self.p_name = row
-            print(f"DEBUG: 数据库读取完成 [{self.customer_name}]")
+            logger.debug(f"数据库读取完成 [{self.customer_name}]")
         except Exception as e:
-            print(f"DEBUG: 数据库读取异常: {e}")
+            logger.error(f"数据库读取异常: {e}")
             traceback.print_exc()
 
         self.setWindowTitle(f"项目深度跟进: {project_no}")
@@ -1371,12 +1445,12 @@ class ProjectDetailDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "UI 加载失败", f"初次渲染详情页时崩溃: {e}")
             traceback.print_exc()
-        print(f"DEBUG: 详情页初始化成功")
+        logger.debug("详情页初始化成功")
         # 【去灰显白】强制设置弹窗整体为白色背景
         self.setStyleSheet("background-color: white;")
 
     def init_ui(self):
-        print("DEBUG: 开始加载 UI 组件")
+        logger.debug("开始加载 UI 组件")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
         
@@ -1407,8 +1481,8 @@ class ProjectDetailDialog(QDialog):
         self.pivot.addItem("finance", "财务合同与回款", lambda: self.stacked.setCurrentWidget(self.finance_page))
 
         self.pivot.setCurrentItem(self.start_tab)
-        print(f"DEBUG: 已设置初始标签为 {self.start_tab}")
-        print("DEBUG: UI 组件加载完成")
+        logger.debug(f"已设置初始标签为 {self.start_tab}")
+        logger.debug("UI 组件加载完成")
 
     def init_follow_page(self):
         layout = QVBoxLayout(self.follow_page)
@@ -1543,7 +1617,7 @@ class ProjectDetailDialog(QDialog):
                     if last_r:
                         contact_cb.setCurrentText(last_r[0])
                         method_cb.setCurrentText(last_r[1])
-            except: pass
+            except Exception: pass
 
         update_visibility(stage_cb.currentText())
 
@@ -1579,7 +1653,7 @@ class ProjectDetailDialog(QDialog):
             d_str = date_e.date.toString("yyyy-MM-dd")
             v_str = visit_date.date.toString("yyyy-MM-dd")
             try: dur = int(duration_le.text() or 0)
-            except: dur = 0
+            except Exception: dur = 0
             try:
                 with get_db_conn() as conn:
                     if edit_id:
@@ -1925,7 +1999,9 @@ class QuotationPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.load_quotes()
+        if getattr(self, '_dirty', True):
+            self.load_quotes()
+            self._dirty = False
 
     def load_quotes(self):
         try:
@@ -2135,8 +2211,17 @@ class QuotationPage(QWidget):
             def refresh_ver():
                 p_no_val = proj_nos[proj_cb.currentIndex()]
                 with get_db_conn(timeout=10) as conn:
-                    count = conn.execute("SELECT COUNT(*) FROM quotations WHERE project_no=?", (p_no_val,)).fetchone()[0]
-                    ver.setText(f"V{count + 1}")
+                    # 查找当前最大版本号 + 1
+                    max_v = 0
+                    cur = conn.execute("SELECT version FROM quotations WHERE project_no=?", (p_no_val,))
+                    for r in cur:
+                        v_str = r[0]
+                        if v_str and v_str.upper().startswith('V'):
+                            try:
+                                v_num = int(v_str[1:])
+                                if v_num > max_v: max_v = v_num
+                            except Exception: pass
+                    ver.setText(f"V{max_v + 1}")
             proj_cb.currentIndexChanged.connect(refresh_ver)
             refresh_ver()
         else:
@@ -2144,8 +2229,17 @@ class QuotationPage(QWidget):
             def auto_set_version():
                 p_no_val = proj_nos[proj_cb.currentIndex()]
                 with get_db_conn(timeout=10) as conn:
-                    count = conn.execute("SELECT COUNT(*) FROM quotations WHERE project_no=?", (p_no_val,)).fetchone()[0]
-                    ver.setText(f"V{count + 1}")
+                    # 查找当前最大版本号 + 1
+                    max_v = 0
+                    cur = conn.execute("SELECT version FROM quotations WHERE project_no=?", (p_no_val,))
+                    for r in cur:
+                        v_str = r[0]
+                        if v_str and v_str.upper().startswith('V'):
+                            try:
+                                v_num = int(v_str[1:])
+                                if v_num > max_v: max_v = v_num
+                            except Exception: pass
+                    ver.setText(f"V{max_v + 1}")
             proj_cb.currentIndexChanged.connect(auto_set_version)
             auto_set_version()
 
@@ -2202,6 +2296,11 @@ class QuotationPage(QWidget):
             p_no_val = proj_nos[proj_cb.currentIndex()]
             v_val = ver.text().strip()
             if not edit_data:
+                # 执行物理级联清理可能的空脏数据
+                with get_db_conn() as conn:
+                    conn.execute("DELETE FROM quotations WHERE project_no=? AND version=? AND amount=0", (p_no_val, v_val))
+                    conn.commit()
+
                 with get_db_conn() as conn:
                     exists = conn.execute("SELECT 1 FROM quotations WHERE project_no=? AND version=?", (p_no_val, v_val)).fetchone()
                     if exists:
@@ -2210,7 +2309,7 @@ class QuotationPage(QWidget):
 
             val_amt = 0.0
             try: val_amt = float(amt.text().replace(",", ""))
-            except: pass
+            except Exception: pass
             
             # 附件物理拷贝
             final_path = self.file_path
@@ -2225,7 +2324,7 @@ class QuotationPage(QWidget):
                     shutil.copy2(self.file_path, abs_dest)
                     final_path = f"attachments/quotations/{save_name}"
                 except Exception as e:
-                    print(f"File copy error: {e}")
+                    logger.warning(f"File copy error: {e}")
 
             # [重构]：将数据库写入与审计日志分离，防止嵌套连接引发的 disk I/O error
             with get_db_conn(timeout=15) as conn:
@@ -2261,7 +2360,7 @@ class ContractPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
         # 绑定系统级刷新信号
-        SIGNAL_BUS.projectChanged.connect(self.load_contracts)
+        SIGNAL_BUS.projectChanged.connect(lambda: setattr(self, '_dirty', True))
         
         btn_bar = QHBoxLayout()
         btn_bar.addWidget(TitleLabel("合同签署与回款监控"))
@@ -2287,7 +2386,9 @@ class ContractPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.load_contracts()
+        if getattr(self, '_dirty', True):
+            self.load_contracts()
+            self._dirty = False
 
     def load_contracts(self):
         try:
@@ -2446,12 +2547,15 @@ class ContractPage(QWidget):
         proj_cb = ComboBox(); proj_nos = []
         pre_fill_idx = -1
         # [MOD] 获取所有项目供选择（如果是编辑模式，则仅显示该项目且锁定）
+        # 使用参数化查询防止 SQL 注入
         sql_proj = "SELECT project_no, project_name FROM projects"
+        sql_params = ()
         if is_edit:
-            sql_proj += f" WHERE project_no='{project_no}'"
+            sql_proj += " WHERE project_no=?"
+            sql_params = (project_no,)
 
         with get_db_conn() as conn:
-            for i, r in enumerate(conn.execute(sql_proj)):
+            for i, r in enumerate(conn.execute(sql_proj, sql_params)):
                 proj_nos.append(r[0])
                 proj_cb.addItem(f"[{r[0]}] {r[1]}")
                 if project_no and r[0] == project_no:
@@ -2525,7 +2629,6 @@ class ContractPage(QWidget):
         # 【重点修复】如果从报价转合同传递了附件，立即同步 UI 状态
         if self.c_file:
             update_file_ui()
-        file_layout.addWidget(del_f_btn)
         
         update_file_ui() # 初始化 UI 状态
         
@@ -2554,7 +2657,7 @@ class ContractPage(QWidget):
                         abs_dest = os.path.join(dest_dir, save_name)
                         shutil.copy2(self.c_file, abs_dest)
                         final_path = f"attachments/contracts/{save_name}"
-                    except: final_path = self.c_file
+                    except Exception: final_path = self.c_file
                 else: final_path = self.c_file
 
             try:
@@ -2600,9 +2703,9 @@ def ensure_columns():
                 cols = [c[1] for c in cursor.fetchall()]
                 if col not in cols:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-                    print(f"DEBUG: 补齐字段 {table}.{col}")
+                    logger.info(f"补齐字段 {table}.{col}")
             except Exception as e:
-                print(f"DEBUG: 补修数据库失败 {table}.{col}: {e}")
+                logger.warning(f"补修数据库失败 {table}.{col}: {e}")
 
         # 1. 补齐报价单表
         add_col("quotations", "amount", "REAL DEFAULT 0.0")
@@ -2636,7 +2739,7 @@ def ensure_columns():
                 if c == 0:
                     dt = s_date or date.today().strftime("%Y-%m-%d")
                     cursor.execute("INSERT INTO payment_plans (project_no, plan_date, plan_amount, actual_amount, status, remark) VALUES (?, ?, ?, ?, '已收', '历史首付款迁移')", (p_no, dt, amt, amt))
-        except: pass
+        except Exception: pass
         
         conn.commit()
 
@@ -2678,7 +2781,9 @@ class LogPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.load_logs()
+        if getattr(self, '_dirty', True):
+            self.load_logs()
+            self._dirty = False
 
     def load_logs(self):
         try:
@@ -2722,7 +2827,7 @@ class LogPage(QWidget):
             self.table.setColumnWidth(2, 100)
             self.table.setColumnWidth(3, 120)
         except Exception as e:
-            print(f"Load Logs Error: {e}")
+            logger.error(f"Load Logs Error: {e}")
 
     def export_logs(self):
         """导出当前视图日志为 CSV (Excel 友好)"""
@@ -2760,7 +2865,7 @@ class BackupManager:
             with get_db_conn() as conn:
                 res = conn.execute("SELECT COUNT(*) FROM projects").fetchone()
                 return res[0] if res else 0
-        except: return 0
+        except Exception: return 0
 
     @staticmethod
     def create_backup(note="用户手动快照", is_auto=False):
@@ -2798,7 +2903,7 @@ class BackupManager:
             # 删除多余文件
             for f in files[keep_count:]:
                 os.remove(os.path.join(BackupManager.BACKUP_DIR, f))
-        except: pass
+        except Exception: pass
 
     @staticmethod
     def perform_restore(backup_name, parent_window):
@@ -2890,7 +2995,7 @@ class BackupPage(QWidget):
             with get_db_conn() as conn:
                 res = conn.execute("SELECT details FROM action_logs WHERE target_id=? AND action_type IN ('数据备份', '自动存档') LIMIT 1", (file_name,)).fetchone()
                 return res[0] if res else "系统快照"
-        except: return "未知"
+        except Exception: return "未知"
 
     def add_table_actions(self, row, file_name):
         container = QWidget()
@@ -2990,7 +3095,7 @@ class MainWindow(FluentWindow):
             
             # 清理陈旧备份 (策略：保留最近 1 个)
             BackupManager.prune_backups(keep_count=1)
-        except: pass
+        except Exception: pass
         super().closeEvent(event)
 
     def create_new_project_for(self, customer_name):
@@ -3007,7 +3112,7 @@ if __name__ == '__main__':
     socket = QLocalSocket()
     socket.connectToServer(server_name)
     if socket.waitForConnected(500):
-        print("Another instance is already running.")
+        logger.info("Another instance is already running.")
         sys.exit(0)
     
     # 启动本地服务器用于锁定
